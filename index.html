@@ -24,7 +24,7 @@
 </style>
 </head>
 <body>
-  <div id="estado">Iniciando...</div>
+  <div id="estado">Tocá GRABAR y dictá</div>
   <textarea id="texto" placeholder="Acá aparece lo que dictás..."></textarea>
   <button id="btnGuardar">💾 GUARDAR NOTA</button>
   <button id="btnGrabar">🎤 GRABAR</button>
@@ -43,7 +43,14 @@
   const est = document.getElementById('estado');
   const btnGrabar = document.getElementById('btnGrabar');
   const btnGuardar = document.getElementById('btnGuardar');
-  let grabando = false, acumulado = '', sesion = '', rec = null, wakeLock = null;
+  let grabando = false, activo = false, acumulado = '', sesion = '', rec = null, wakeLock = null;
+
+  // El motor de Android se apaga solo ante un silencio; rearrancarlo al instante
+  // y reintentar cada 100 ms minimiza la pérdida del arranque de la frase siguiente.
+  function reiniciarYa() {
+    if (!grabando || activo) return;
+    try { rec.start(); } catch (e) { setTimeout(reiniciarYa, 100); }
+  }
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
 
@@ -70,10 +77,11 @@
       txt.value = (acumulado + sesion + interim).trim();
       txt.scrollTop = txt.scrollHeight;
     };
+    rec.onstart = () => { activo = true; };
     rec.onend = () => {
-      // Android corta el reconocimiento solo: reiniciar para soportar dictados largos.
+      activo = false;
       acumulado += sesion; sesion = '';
-      if (grabando) { try { rec.start(); } catch(e){} }
+      reiniciarYa();
     };
     rec.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
@@ -157,7 +165,7 @@
     try { navigator.wakeLock.request('screen').then(w => wakeLock = w); } catch(e){}
   } else {
     reenviarPendientes();
-    setTimeout(empezar, 600);
+    setEstado('Tocá GRABAR y dictá');
   }
 
   // Si vuelve la señal con la app abierta, mandar lo que quedó en cola.
