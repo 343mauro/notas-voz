@@ -80,6 +80,12 @@
         grabando = false; btnGrabar.classList.remove('rec');
         setEstado('Permití el micrófono y tocá GRABAR');
       }
+      if (e.error === 'network') {
+        // El mic violeta transcribe en servidores de Google: sin internet no funciona.
+        parar();
+        setEstado('Sin internet: dictá con el micrófono del teclado y tocá GUARDAR');
+        txt.focus();
+      }
     };
   } else {
     setEstado('Este navegador no tiene dictado por voz');
@@ -145,10 +151,20 @@
   if (!TOKEN) {
     setEstado('Falta la clave: abrí la app con el enlace completo que te pasó Claude');
     btnGuardar.disabled = true;
+  } else if (!navigator.onLine) {
+    // Sin internet el mic violeta no transcribe: ir directo al plan del teclado.
+    setEstado('Sin internet: dictá con el micrófono del teclado y tocá GUARDAR');
+    try { navigator.wakeLock.request('screen').then(w => wakeLock = w); } catch(e){}
   } else {
     reenviarPendientes();
     setTimeout(empezar, 600);
   }
+
+  // Si vuelve la señal con la app abierta, mandar lo que quedó en cola.
+  window.addEventListener('online', reenviarPendientes);
+
+  // Dejar la app guardada en el teléfono para abrirla sin internet.
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 </script>
 </body>
 </html>
