@@ -56,9 +56,16 @@
     rec.onresult = (e) => {
       let final = '', interim = '';
       for (let i = 0; i < e.results.length; i++) {
-        if (e.results[i].isFinal) final += e.results[i][0].transcript + ' ';
-        else interim += e.results[i][0].transcript;
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          // Bug de Android: cada resultado "final" repite toda la frase anterior.
+          // Si el nuevo texto ya contiene lo acumulado, reemplaza en vez de sumar.
+          if (t.trim().startsWith(final.trim())) final = t + ' ';
+          else final += t + ' ';
+        } else interim += t;
       }
+      // Si tras reiniciar Android reenvía la misma frase ya guardada, no duplicarla.
+      if (final.trim() && acumulado.trim().endsWith(final.trim())) final = '';
       sesion = final;
       txt.value = (acumulado + sesion + interim).trim();
       txt.scrollTop = txt.scrollHeight;
