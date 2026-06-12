@@ -1,6 +1,6 @@
 // Guarda la app en el teléfono para que abra sin internet.
 // Estrategia: sirve la copia guardada al instante y la actualiza en segundo plano.
-const CACHE = 'notas-voz-v1';
+const CACHE = 'notas-voz-v2';
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['./', './index.html'])));
@@ -8,7 +8,11 @@ self.addEventListener('install', (e) => {
 });
 
 self.addEventListener('activate', (e) => {
-  e.waitUntil(self.clients.claim());
+  e.waitUntil(
+    caches.keys()
+      .then((claves) => Promise.all(claves.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
 });
 
 self.addEventListener('fetch', (e) => {

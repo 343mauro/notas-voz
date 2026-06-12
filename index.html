@@ -9,10 +9,12 @@
   body { margin:0; font-family:sans-serif; background:#1e1e2e; color:#eee;
          display:flex; flex-direction:column; align-items:center; padding:14px;
          min-height:100vh; box-sizing:border-box; }
-  #estado { font-size:26px; font-weight:bold; margin:10px 0; min-height:34px; text-align:center; }
+  #estado { font-size:24px; font-weight:bold; margin:8px 0; min-height:32px; text-align:center; }
   #estado.grabando { color:#f87171; }
   #estado.ok { color:#4ade80; }
-  #texto { width:100%; flex:1; min-height:30vh; font-size:20px; border-radius:14px; border:none;
+  #timer { font-size:56px; font-weight:bold; color:#f87171; min-height:66px;
+           visibility:hidden; font-variant-numeric:tabular-nums; }
+  #texto { width:100%; flex:1; min-height:24vh; font-size:20px; border-radius:14px; border:none;
            padding:14px; box-sizing:border-box; background:#2a2a3c; color:#eee; }
   button { width:100%; border:none; border-radius:18px; color:#fff; font-weight:bold;
            margin-top:14px; padding:26px 0; font-size:26px; }
@@ -24,14 +26,17 @@
 </style>
 </head>
 <body>
-  <div id="estado">Tocá GRABAR y dictá</div>
-  <textarea id="texto" placeholder="Acá aparece lo que dictás..."></textarea>
+  <div id="estado">Tocá GRABAR y hablá</div>
+  <div id="timer">00:00</div>
+  <textarea id="texto" placeholder="...o escribí/dictá acá con el teclado y tocá GUARDAR."></textarea>
   <button id="btnGuardar">💾 GUARDAR NOTA</button>
   <button id="btnGrabar">🎤 GRABAR</button>
 
 <script>
   // ===== CONFIGURACIÓN =====
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
+  const TROZO_MS = 5 * 60 * 1000; // la grabación se parte en bloques de 5 minutos
+
   // La clave NO va en el código público: llega una vez en el enlace (#clave) y queda guardada en el teléfono.
   if (location.hash.length > 1) {
     localStorage.setItem('token', location.hash.slice(1));
@@ -41,139 +46,185 @@
 
   const txt = document.getElementById('texto');
   const est = document.getElementById('estado');
+  const timerEl = document.getElementById('timer');
   const btnGrabar = document.getElementById('btnGrabar');
   const btnGuardar = document.getElementById('btnGuardar');
-  let grabando = false, activo = false, acumulado = '', sesion = '', rec = null, wakeLock = null, micAbierto = null;
 
-  // El motor de Android se apaga solo ante un silencio; rearrancarlo al instante
-  // y reintentar cada 100 ms minimiza la pérdida del arranque de la frase siguiente.
-  function reiniciarYa() {
-    if (!grabando || activo) return;
-    try { rec.start(); } catch (e) { setTimeout(reiniciarYa, 100); }
-  }
+  let grabando = false, mediaStream = null, recorder = null, corteTimeout = null;
+  let sesionId = '', parte = 0, t0 = 0, timerInt = null, wakeLock = null, enviando = false;
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
-
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (SR) {
-    rec = new SR();
-    rec.lang = 'es-AR';
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.onresult = (e) => {
-      let final = '', interim = '';
-      for (let i = 0; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          // Bug de Android: cada resultado "final" repite toda la frase anterior.
-          // Si el nuevo texto ya contiene lo acumulado, reemplaza en vez de sumar.
-          if (t.trim().startsWith(final.trim())) final = t + ' ';
-          else final += t + ' ';
-        } else interim += t;
-      }
-      // Si tras reiniciar Android reenvía la misma frase ya guardada, no duplicarla.
-      if (final.trim() && acumulado.trim().endsWith(final.trim())) final = '';
-      sesion = final;
-      txt.value = (acumulado + sesion + interim).trim();
-      txt.scrollTop = txt.scrollHeight;
-    };
-    rec.onstart = () => { activo = true; };
-    rec.onend = () => {
-      activo = false;
-      acumulado += sesion; sesion = '';
-      reiniciarYa();
-    };
-    rec.onerror = (e) => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        grabando = false; btnGrabar.classList.remove('rec');
-        setEstado('Permití el micrófono y tocá GRABAR');
-      }
-      if (e.error === 'network') {
-        // El mic violeta transcribe en servidores de Google: sin internet no funciona.
-        parar();
-        setEstado('Sin internet: dictá con el micrófono del teclado y tocá GUARDAR');
-        txt.focus();
-      }
-    };
-  } else {
-    setEstado('Este navegador no tiene dictado por voz');
+  function mostrarTimer() {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    timerEl.textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
 
+  // ===== COLA PERSISTENTE (IndexedDB): sobrevive cierres y falta de señal =====
+  function abrirDB() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('notas-voz', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('cola', { keyPath: 'id', autoIncrement: true });
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function encolar(item) {
+    const d = await abrirDB();
+    return new Promise((res, rej) => {
+      const tx = d.transaction('cola', 'readwrite');
+      tx.objectStore('cola').add(item);
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function colaPendiente() {
+    const d = await abrirDB();
+    return new Promise((res, rej) => {
+      const rq = d.transaction('cola').objectStore('cola').getAll();
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+  async function quitarDeCola(id) {
+    const d = await abrirDB();
+    return new Promise((res, rej) => {
+      const tx = d.transaction('cola', 'readwrite');
+      tx.objectStore('cola').delete(id);
+      tx.oncomplete = res;
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+
+  // Envía lo encolado en orden; si falla (sin señal), queda para el próximo intento.
+  async function drenarCola(mostrar) {
+    if (enviando) return;
+    enviando = true;
+    try {
+      let items = await colaPendiente();
+      while (items.length) {
+        if (mostrar) setEstado('Guardando... (falta' + (items.length > 1 ? 'n ' + items.length + ' partes' : ' 1 parte') + ')');
+        const it = items[0];
+        const cuerpo = it.tipo === 'audio'
+          ? { token: TOKEN, accion: 'audio', sesion: it.sesion, parte: it.parte, mime: it.mime, audio: it.datos }
+          : it.tipo === 'fin'
+          ? { token: TOKEN, accion: 'fin', sesion: it.sesion }
+          : { token: TOKEN, texto: it.texto };
+        const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify(cuerpo) });
+        const resp = await r.text();
+        if (resp !== 'ok') throw new Error(resp);
+        await quitarDeCola(it.id);
+        items = await colaPendiente();
+      }
+      if (mostrar) setEstado('✔ Guardada en tu vault', 'ok');
+    } catch (e) {
+      if (mostrar) setEstado('📥 Sin señal: queda en el teléfono y se envía sola', 'ok');
+    }
+    enviando = false;
+  }
+
+  function aBase64(blob) {
+    return new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result.split(',')[1]);
+      fr.onerror = () => rej(fr.error);
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  // ===== GRABACIÓN DE AUDIO (sin beeps: no usa el reconocedor del sistema) =====
+  const tipoAudio = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))
+    ? 'audio/webm' : '';
+
   async function empezar() {
-    if (!rec || grabando) return;
-    grabando = true; btnGrabar.classList.add('rec');
+    if (grabando) return;
+    try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch (e) { setEstado('Permití el micrófono y tocá GRABAR'); return; }
+    grabando = true;
+    sesionId = Date.now().toString(36);
+    parte = 0;
+    btnGrabar.classList.add('rec');
     setEstado('🔴 GRABANDO — hablá tranquilo', 'grabando');
-    acumulado = txt.value ? txt.value.trim() + ' ' : ''; sesion = '';
-    // Mantener el micrófono abierto todo el tiempo evita que Android haga
-    // el beep en cada reinicio del reconocedor: suena solo al empezar.
-    try { micAbierto = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e){}
-    try { rec.start(); } catch(e){}
-    try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+    t0 = Date.now(); mostrarTimer();
+    timerEl.style.visibility = 'visible';
+    timerInt = setInterval(mostrarTimer, 1000);
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    nuevoTramo();
+  }
+
+  function nuevoTramo() {
+    const opciones = tipoAudio ? { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 32000 } : {};
+    recorder = new MediaRecorder(mediaStream, opciones);
+    const trozos = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) trozos.push(e.data); };
+    recorder.onstop = async () => {
+      const blob = new Blob(trozos, { type: recorder.mimeType || 'audio/webm' });
+      if (blob.size > 0) {
+        parte++;
+        await encolar({ tipo: 'audio', sesion: sesionId, parte: parte, mime: blob.type, datos: await aBase64(blob) });
+      }
+      if (grabando) {
+        nuevoTramo();         // siguiente bloque, sin que el usuario lo note
+        drenarCola(false);    // y el anterior se sube en segundo plano
+      } else {
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        if (wakeLock) { wakeLock.release(); wakeLock = null; }
+        await encolar({ tipo: 'fin', sesion: sesionId });
+        drenarCola(true);
+      }
+    };
+    recorder.start();
+    corteTimeout = setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, TROZO_MS);
   }
 
   function parar() {
-    grabando = false; btnGrabar.classList.remove('rec');
-    if (rec) rec.stop();
-    if (micAbierto) { micAbierto.getTracks().forEach(t => t.stop()); micAbierto = null; }
-    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    grabando = false;
+    btnGrabar.classList.remove('rec');
+    clearTimeout(corteTimeout);
+    clearInterval(timerInt);
+    timerEl.style.visibility = 'hidden';
+    setEstado('Transcribiendo y guardando...');
+    if (recorder && recorder.state === 'recording') recorder.stop();
   }
 
-  btnGrabar.onclick = () => { grabando ? (parar(), setEstado('En pausa — tocá GRABAR o GUARDAR')) : empezar(); };
-
-  // ===== GUARDADO (con respaldo local por si no hay señal) =====
-  async function enviar(texto) {
-    const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify({ token: TOKEN, texto: texto }) });
-    const resp = await r.text();
-    if (resp !== 'ok') throw new Error(resp);
-  }
-
-  async function reenviarPendientes() {
-    const pendientes = JSON.parse(localStorage.getItem('pendientes') || '[]');
-    if (!pendientes.length) return;
-    const quedan = [];
-    for (const p of pendientes) {
-      try { await enviar(p); } catch(e) { quedan.push(p); }
-    }
-    localStorage.setItem('pendientes', JSON.stringify(quedan));
-    if (pendientes.length && !quedan.length) setEstado('✔ Notas pendientes enviadas', 'ok');
-  }
+  btnGrabar.onclick = () => {
+    if (grabando) { setEstado('Para terminar tocá GUARDAR NOTA', 'grabando'); return; }
+    empezar();
+  };
 
   btnGuardar.onclick = async () => {
+    if (grabando) { parar(); return; }
     const t = txt.value.trim();
     if (!t) { setEstado('No hay nada que guardar'); return; }
-    parar();
     btnGuardar.disabled = true;
-    setEstado('Guardando...');
-    try {
-      await enviar(t);
-      txt.value = ''; acumulado = '';
-      setEstado('✔ Guardada en tu vault', 'ok');
-    } catch(e) {
-      // Sin señal: guardar local y reintentar cuando vuelva a abrir la app
-      const pendientes = JSON.parse(localStorage.getItem('pendientes') || '[]');
-      pendientes.push(t);
-      localStorage.setItem('pendientes', JSON.stringify(pendientes));
-      txt.value = ''; acumulado = '';
-      setEstado('📥 Sin señal: guardada en el teléfono, se envía sola después', 'ok');
-    }
+    await encolar({ tipo: 'texto', texto: t });
+    txt.value = '';
+    await drenarCola(true);
     btnGuardar.disabled = false;
   };
 
-  // Al abrir: reintentar pendientes y arrancar a grabar solo
+  // Avisar si se intenta cerrar la app con una grabación en curso.
+  window.addEventListener('beforeunload', (e) => {
+    if (grabando) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // ===== AL ABRIR =====
   if (!TOKEN) {
     setEstado('Falta la clave: abrí la app con el enlace completo que te pasó Claude');
     btnGuardar.disabled = true;
-  } else if (!navigator.onLine) {
-    // Sin internet el mic violeta no transcribe: ir directo al plan del teclado.
-    setEstado('Sin internet: dictá con el micrófono del teclado y tocá GUARDAR');
-    try { navigator.wakeLock.request('screen').then(w => wakeLock = w); } catch(e){}
+    btnGrabar.disabled = true;
   } else {
-    reenviarPendientes();
-    setEstado('Tocá GRABAR y dictá');
+    (async () => {
+      // Notas que hayan quedado del sistema anterior (localStorage)
+      const viejas = JSON.parse(localStorage.getItem('pendientes') || '[]');
+      for (const v of viejas) await encolar({ tipo: 'texto', texto: v });
+      localStorage.removeItem('pendientes');
+      const items = await colaPendiente();
+      if (items.length) { setEstado('Enviando lo pendiente...'); drenarCola(true); }
+    })();
   }
 
   // Si vuelve la señal con la app abierta, mandar lo que quedó en cola.
-  window.addEventListener('online', reenviarPendientes);
+  window.addEventListener('online', () => { if (!grabando) drenarCola(false); });
 
   // Dejar la app guardada en el teléfono para abrirla sin internet.
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
