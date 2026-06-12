@@ -43,7 +43,7 @@
   const est = document.getElementById('estado');
   const btnGrabar = document.getElementById('btnGrabar');
   const btnGuardar = document.getElementById('btnGuardar');
-  let grabando = false, activo = false, acumulado = '', sesion = '', rec = null, wakeLock = null;
+  let grabando = false, activo = false, acumulado = '', sesion = '', rec = null, wakeLock = null, micAbierto = null;
 
   // El motor de Android se apaga solo ante un silencio; rearrancarlo al instante
   // y reintentar cada 100 ms minimiza la pérdida del arranque de la frase siguiente.
@@ -104,6 +104,9 @@
     grabando = true; btnGrabar.classList.add('rec');
     setEstado('🔴 GRABANDO — hablá tranquilo', 'grabando');
     acumulado = txt.value ? txt.value.trim() + ' ' : ''; sesion = '';
+    // Mantener el micrófono abierto todo el tiempo evita que Android haga
+    // el beep en cada reinicio del reconocedor: suena solo al empezar.
+    try { micAbierto = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e){}
     try { rec.start(); } catch(e){}
     try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
   }
@@ -111,6 +114,7 @@
   function parar() {
     grabando = false; btnGrabar.classList.remove('rec');
     if (rec) rec.stop();
+    if (micAbierto) { micAbierto.getTracks().forEach(t => t.stop()); micAbierto = null; }
     if (wakeLock) { wakeLock.release(); wakeLock = null; }
   }
 
