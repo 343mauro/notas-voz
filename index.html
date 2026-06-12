@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="theme-color" content="#1e1e2e">
+<title>Nota de voz</title>
+<style>
+  body { margin:0; font-family:sans-serif; background:#1e1e2e; color:#eee;
+         display:flex; flex-direction:column; align-items:center; padding:14px;
+         min-height:100vh; box-sizing:border-box; }
+  #estado { font-size:26px; font-weight:bold; margin:10px 0; min-height:34px; text-align:center; }
+  #estado.grabando { color:#f87171; }
+  #estado.ok { color:#4ade80; }
+  #texto { width:100%; flex:1; min-height:30vh; font-size:20px; border-radius:14px; border:none;
+           padding:14px; box-sizing:border-box; background:#2a2a3c; color:#eee; }
+  button { width:100%; border:none; border-radius:18px; color:#fff; font-weight:bold;
+           margin-top:14px; padding:26px 0; font-size:26px; }
+  button:disabled { opacity:.45; }
+  #btnGrabar { background:#7c3aed; }
+  #btnGrabar.rec { background:#dc2626; animation:p 1.2s infinite; }
+  @keyframes p { 50% { opacity:.75; } }
+  #btnGuardar { background:#16a34a; padding:34px 0; font-size:30px; }
+</style>
+</head>
+<body>
+  <div id="estado">Iniciando...</div>
+  <textarea id="texto" placeholder="Acá aparece lo que dictás..."></textarea>
+  <button id="btnGuardar">💾 GUARDAR NOTA</button>
+  <button id="btnGrabar">🎤 GRABAR</button>
+
+<script>
+  // ===== CONFIGURACIÓN =====
+  const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
+  // La clave NO va en el código público: llega una vez en el enlace (#clave) y queda guardada en el teléfono.
+  if (location.hash.length > 1) {
+    localStorage.setItem('token', location.hash.slice(1));
+    history.replaceState(null, '', location.pathname);
+  }
+  const TOKEN = localStorage.getItem('token') || '';
+
+  const txt = document.getElementById('texto');
+  const est = document.getElementById('estado');
+  const btnGrabar = document.getElementById('btnGrabar');
+  const btnGuardar = document.getElementById('btnGuardar');
+  let grabando = false, acumulado = '', sesion = '', rec = null, wakeLock = null;
+
+  function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SR) {
+    rec = new SR();
+    rec.lang = 'es-AR';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.onresult = (e) => {
+      let final = '', interim = '';
+      for (let i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript + ' ';
+        else interim += e.results[i][0].transcript;
+      }
+      sesion = final;
+      txt.value = (acumulado + sesion + interim).trim();
+      txt.scrollTop = txt.scrollHeight;
+    };
+    rec.onend = () => {
+      // Android corta el reconocimiento solo: reiniciar para soportar dictados largos.
+      acumulado += sesion; sesion = '';
+      if (grabando) { try { rec.start(); } catch(e){} }
+    };
+    rec.onerror = (e) => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        grabando = false; btnGrabar.classList.remove('rec');
+        setEstado('Permití el micrófono y tocá GRABAR');
+      }
+    };
+  } else {
+    setEstado('Este navegador no tiene dictado por voz');
+  }
+
+  async function empezar() {
+    if (!rec || grabando) return;
+    grabando = true; btnGrabar.classList.add('rec');
+    setEstado('🔴 GRABANDO — hablá tranquilo', 'grabando');
+    acumulado = txt.value ? txt.value.trim() + ' ' : ''; sesion = '';
+    try { rec.start(); } catch(e){}
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+  }
+
+  function parar() {
+    grabando = false; btnGrabar.classList.remove('rec');
+    if (rec) rec.stop();
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  }
+
+  btnGrabar.onclick = () => { grabando ? (parar(), setEstado('En pausa — tocá GRABAR o GUARDAR')) : empezar(); };
+
+  // ===== GUARDADO (con respaldo local por si no hay señal) =====
+  async function enviar(texto) {
+    const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify({ token: TOKEN, texto: texto }) });
+    const resp = await r.text();
+    if (resp !== 'ok') throw new Error(resp);
+  }
+
+  async function reenviarPendientes() {
+    const pendientes = JSON.parse(localStorage.getItem('pendientes') || '[]');
+    if (!pendientes.length) return;
+    const quedan = [];
+    for (const p of pendientes) {
+      try { await enviar(p); } catch(e) { quedan.push(p); }
+    }
+    localStorage.setItem('pendientes', JSON.stringify(quedan));
+    if (pendientes.length && !quedan.length) setEstado('✔ Notas pendientes enviadas', 'ok');
+  }
+
+  btnGuardar.onclick = async () => {
+    const t = txt.value.trim();
+    if (!t) { setEstado('No hay nada que guardar'); return; }
+    parar();
+    btnGuardar.disabled = true;
+    setEstado('Guardando...');
+    try {
+      await enviar(t);
+      txt.value = ''; acumulado = '';
+      setEstado('✔ Guardada en tu vault', 'ok');
+    } catch(e) {
+      // Sin señal: guardar local y reintentar cuando vuelva a abrir la app
+      const pendientes = JSON.parse(localStorage.getItem('pendientes') || '[]');
+      pendientes.push(t);
+      localStorage.setItem('pendientes', JSON.stringify(pendientes));
+      txt.value = ''; acumulado = '';
+      setEstado('📥 Sin señal: guardada en el teléfono, se envía sola después', 'ok');
+    }
+    btnGuardar.disabled = false;
+  };
+
+  // Al abrir: reintentar pendientes y arrancar a grabar solo
+  if (!TOKEN) {
+    setEstado('Falta la clave: abrí la app con el enlace completo que te pasó Claude');
+    btnGuardar.disabled = true;
+  } else {
+    reenviarPendientes();
+    setTimeout(empezar, 600);
+  }
+</script>
+</body>
+</html>
