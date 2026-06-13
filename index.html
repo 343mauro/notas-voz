@@ -2,27 +2,34 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#1e1e2e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>Nota de voz</title>
 <style>
   body { margin:0; font-family:sans-serif; background:#1e1e2e; color:#eee;
-         display:flex; flex-direction:column; align-items:center; padding:14px;
+         display:flex; flex-direction:column; align-items:center;
+         padding:12px calc(12px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
          min-height:100vh; box-sizing:border-box; }
-  #estado { font-size:24px; font-weight:bold; margin:8px 0; min-height:32px; text-align:center; }
+  #estado { font-size:22px; font-weight:bold; margin:6px 0; min-height:30px; text-align:center; }
   #estado.grabando { color:#f87171; }
   #estado.ok { color:#4ade80; }
-  #timer { font-size:56px; font-weight:bold; color:#f87171; min-height:66px;
+  #timer { font-size:52px; font-weight:bold; color:#f87171; min-height:60px;
            visibility:hidden; font-variant-numeric:tabular-nums; }
-  #texto { width:100%; flex:1; min-height:24vh; font-size:20px; border-radius:14px; border:none;
-           padding:14px; box-sizing:border-box; background:#2a2a3c; color:#eee; }
+  #texto { width:100%; flex:1; min-height:13vh; font-size:19px; border-radius:14px; border:none;
+           padding:12px; box-sizing:border-box; background:#2a2a3c; color:#eee; }
   button { width:100%; border:none; border-radius:18px; color:#fff; font-weight:bold;
-           margin-top:14px; padding:26px 0; font-size:26px; }
+           margin-top:12px; padding:24px 0; font-size:25px; }
   button:disabled { opacity:.45; }
   #btnGrabar { background:#7c3aed; }
   #btnGrabar.rec { background:#dc2626; animation:p 1.2s infinite; }
-  @keyframes p { 50% { opacity:.75; } }
-  #btnGuardar { background:#16a34a; padding:34px 0; font-size:30px; }
+  @keyframes p { 50% { opacity:.7; } }
+  #btnGuardar { background:#16a34a; padding:30px 0; font-size:28px; }
+  #version { margin-top:8px; font-size:12px; color:#6b6b85; }
 </style>
 </head>
 <body>
@@ -31,11 +38,15 @@
   <textarea id="texto" placeholder="...o escribí/dictá acá con el teclado y tocá GUARDAR."></textarea>
   <button id="btnGuardar">💾 GUARDAR NOTA</button>
   <button id="btnGrabar">🎤 GRABAR</button>
+  <div id="version"></div>
 
 <script>
   // ===== CONFIGURACIÓN =====
+  const VERSION = 'v2.0';
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
-  const TROZO_MS = 5 * 60 * 1000; // la grabación se parte en bloques de 5 minutos
+  const TROZO_MS = 60 * 1000;     // la grabación se parte en bloques de 1 minuto
+  const ESPACIADO_MS = 6000;      // pausa entre subidas para respetar el límite gratuito de Gemini
+  const MAX_INTENTOS = 5;         // reintentos de un bloque con error antes de mandarlo al final
 
   // La clave NO va en el código público: llega una vez en el enlace (#clave) y queda guardada en el teléfono.
   if (location.hash.length > 1) {
@@ -49,11 +60,13 @@
   const timerEl = document.getElementById('timer');
   const btnGrabar = document.getElementById('btnGrabar');
   const btnGuardar = document.getElementById('btnGuardar');
+  document.getElementById('version').textContent = VERSION;
 
   let grabando = false, mediaStream = null, recorder = null, corteTimeout = null;
   let sesionId = '', parte = 0, t0 = 0, timerInt = null, wakeLock = null, enviando = false;
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
+  function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
   function mostrarTimer() {
     const s = Math.floor((Date.now() - t0) / 1000);
     timerEl.textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
@@ -68,58 +81,82 @@
       r.onerror = () => rej(r.error);
     });
   }
+  function txCola(modo) { return abrirDB().then(d => d.transaction('cola', modo).objectStore('cola')); }
   async function encolar(item) {
-    const d = await abrirDB();
-    return new Promise((res, rej) => {
-      const tx = d.transaction('cola', 'readwrite');
-      tx.objectStore('cola').add(item);
-      tx.oncomplete = res;
-      tx.onerror = () => rej(tx.error);
-    });
+    const st = await txCola('readwrite');
+    return new Promise((res, rej) => { const q = st.add(item); q.onsuccess = res; q.onerror = () => rej(q.error); });
   }
   async function colaPendiente() {
-    const d = await abrirDB();
-    return new Promise((res, rej) => {
-      const rq = d.transaction('cola').objectStore('cola').getAll();
-      rq.onsuccess = () => res(rq.result);
-      rq.onerror = () => rej(rq.error);
-    });
+    const st = await txCola('readonly');
+    return new Promise((res, rej) => { const q = st.getAll(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); });
   }
   async function quitarDeCola(id) {
-    const d = await abrirDB();
-    return new Promise((res, rej) => {
-      const tx = d.transaction('cola', 'readwrite');
-      tx.objectStore('cola').delete(id);
-      tx.oncomplete = res;
-      tx.onerror = () => rej(tx.error);
-    });
+    const st = await txCola('readwrite');
+    return new Promise((res, rej) => { const q = st.delete(id); q.onsuccess = res; q.onerror = () => rej(q.error); });
+  }
+  async function actualizarEnCola(item) {
+    const st = await txCola('readwrite');
+    return new Promise((res, rej) => { const q = st.put(item); q.onsuccess = res; q.onerror = () => rej(q.error); });
+  }
+  // Reencola al final (nuevo id) y borra el viejo: el bloque no traba a los demás.
+  async function moverAlFinal(item) {
+    const copia = Object.assign({}, item); delete copia.id;
+    await encolar(copia);
+    await quitarDeCola(item.id);
   }
 
-  // Envía lo encolado en orden; si falla (sin señal), queda para el próximo intento.
+  function cuerpoDe(it) {
+    if (it.tipo === 'audio') return { token: TOKEN, accion: 'audio', sesion: it.sesion, parte: it.parte, mime: it.mime, audio: it.datos };
+    if (it.tipo === 'fin')   return { token: TOKEN, accion: 'fin', sesion: it.sesion };
+    return { token: TOKEN, texto: it.texto };
+  }
+
+  // Drena la cola en orden. Distingue falta de señal real (corta y reintenta luego)
+  // de errores del servidor (reintenta el bloque y, si insiste, lo manda al final).
   async function drenarCola(mostrar) {
     if (enviando) return;
     enviando = true;
+    let vueltas = 0;
     try {
       let items = await colaPendiente();
-      while (items.length) {
-        if (mostrar) setEstado('Guardando... (falta' + (items.length > 1 ? 'n ' + items.length + ' partes' : ' 1 parte') + ')');
-        const it = items[0];
-        const cuerpo = it.tipo === 'audio'
-          ? { token: TOKEN, accion: 'audio', sesion: it.sesion, parte: it.parte, mime: it.mime, audio: it.datos }
-          : it.tipo === 'fin'
-          ? { token: TOKEN, accion: 'fin', sesion: it.sesion }
-          : { token: TOKEN, texto: it.texto };
-        const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify(cuerpo) });
-        const resp = await r.text();
-        if (resp !== 'ok') throw new Error(resp);
-        await quitarDeCola(it.id);
-        items = await colaPendiente();
+      while (items.length && vueltas++ < 1000) {
+        let it = items[0];
+        // 'fin' se procesa recién cuando ya no quedan partes de audio/texto por delante.
+        if (it.tipo === 'fin' && items.length > 1) { await moverAlFinal(it); items = await colaPendiente(); continue; }
+
+        const reales = items.filter(x => x.tipo !== 'fin').length;
+        if (mostrar) setEstado(reales > 0
+          ? 'Guardando... (queda' + (reales > 1 ? 'n ' + reales + ' partes)' : ' 1 parte)')
+          : 'Cerrando nota...');
+
+        let resp;
+        try {
+          const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify(cuerpoDe(it)) });
+          resp = await r.text();
+        } catch (errRed) {
+          if (mostrar) setEstado('📡 Sin conexión: queda en el teléfono, se envía solo al recuperar señal', 'ok');
+          break; // problema de red REAL: reintentar en el próximo 'online' o al reabrir
+        }
+
+        if (resp === 'ok' || resp === 'vacío') {
+          await quitarDeCola(it.id);
+          items = await colaPendiente();
+          if (items.length) await esperar(ESPACIADO_MS);
+        } else if (resp === 'rate-limit') {
+          if (mostrar) setEstado('Procesando... (Gemini ocupado, reintento en unos segundos)');
+          await esperar(15000);
+        } else { // 'error-transcripcion', 'error', 'no-autorizado', etc.
+          it.intentos = (it.intentos || 0) + 1;
+          if (it.intentos >= MAX_INTENTOS) { await moverAlFinal(it); }
+          else { await actualizarEnCola(it); await esperar(8000); }
+          items = await colaPendiente();
+        }
       }
-      if (mostrar) setEstado('✔ Guardada en tu vault', 'ok');
-    } catch (e) {
-      if (mostrar) setEstado('📥 Sin señal: queda en el teléfono y se envía sola', 'ok');
+      const quedan = await colaPendiente();
+      if (mostrar && quedan.length === 0) setEstado('✔ Guardada en tu vault', 'ok');
+    } finally {
+      enviando = false;
     }
-    enviando = false;
   }
 
   function aBase64(blob) {
@@ -140,10 +177,11 @@
     try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
     catch (e) { setEstado('Permití el micrófono y tocá GRABAR'); return; }
     grabando = true;
-    sesionId = Date.now().toString(36);
+    sesionId = Date.now().toString(36) + Math.floor(Math.random() * 1000);
     parte = 0;
     btnGrabar.classList.add('rec');
-    setEstado('🔴 GRABANDO — hablá tranquilo', 'grabando');
+    btnGrabar.textContent = '⏺ GRABANDO';
+    setEstado('Hablá tranquilo — tocá GUARDAR al terminar', 'grabando');
     t0 = Date.now(); mostrarTimer();
     timerEl.style.visibility = 'visible';
     timerInt = setInterval(mostrarTimer, 1000);
@@ -179,6 +217,7 @@
   function parar() {
     grabando = false;
     btnGrabar.classList.remove('rec');
+    btnGrabar.textContent = '🎤 GRABAR';
     clearTimeout(corteTimeout);
     clearInterval(timerInt);
     timerEl.style.visibility = 'hidden';
@@ -214,17 +253,13 @@
     btnGrabar.disabled = true;
   } else {
     (async () => {
-      // Notas que hayan quedado del sistema anterior (localStorage)
-      const viejas = JSON.parse(localStorage.getItem('pendientes') || '[]');
-      for (const v of viejas) await encolar({ tipo: 'texto', texto: v });
-      localStorage.removeItem('pendientes');
       const items = await colaPendiente();
-      if (items.length) { setEstado('Enviando lo pendiente...'); drenarCola(true); }
+      if (items.length) { setEstado('Enviando lo que quedó pendiente...'); drenarCola(true); }
     })();
   }
 
   // Si vuelve la señal con la app abierta, mandar lo que quedó en cola.
-  window.addEventListener('online', () => { if (!grabando) drenarCola(false); });
+  window.addEventListener('online', () => { if (!grabando) drenarCola(true); });
 
   // Dejar la app guardada en el teléfono para abrirla sin internet.
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
