@@ -47,7 +47,7 @@
 
 <script>
   // ===== CONFIGURACIÓN =====
-  const VERSION = 'v2.1';
+  const VERSION = 'v2.2';
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
   const TROZO_MS = 60 * 1000;     // la grabación se parte en bloques de 1 minuto
   const ESPACIADO_MS = 6000;      // pausa entre subidas para respetar el límite gratuito de Gemini
@@ -69,8 +69,8 @@
   const ayuda = document.getElementById('ayuda');
   document.getElementById('version').textContent = VERSION;
 
-  let grabando = false, pausado = false, mediaStream = null, recorder = null, corteTimeout = null;
-  let sesionId = '', parte = 0, t0 = 0, acumuladoMs = 0, timerInt = null, wakeLock = null, enviando = false;
+  let grabando = false, pausado = false, descartando = false, mediaStream = null, recorder = null, corteTimeout = null;
+  let sesionId = '', parte = 0, t0 = 0, acumuladoMs = 0, timerInt = null, wakeLock = null, enviando = false, mostrarProgreso = false;
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
   function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -126,7 +126,10 @@
     return { token: TOKEN, texto: it.texto };
   }
 
-  async function drenarCola(mostrar) {
+  // Drena la cola en orden. El feedback se controla con la bandera global
+  // mostrarProgreso, así el aviso final "✔ Guardada" aparece aunque la subida
+  // la haya arrancado un drenado de segundo plano.
+  async function drenarCola() {
     if (enviando) return;
     enviando = true;
     let vueltas = 0;
@@ -137,7 +140,7 @@
         if (it.tipo === 'fin' && items.length > 1) { await moverAlFinal(it); items = await colaPendiente(); continue; }
 
         const reales = items.filter(x => x.tipo === 'audio' || x.tipo === 'texto').length;
-        if (mostrar) setEstado(reales > 0
+        if (mostrarProgreso) setEstado(reales > 0
           ? 'Guardando... (queda' + (reales > 1 ? 'n ' + reales + ' partes)' : ' 1 parte)')
           : 'Cerrando nota...');
 
@@ -146,7 +149,7 @@
           const r = await fetch(URL_SCRIPT, { method: 'POST', body: JSON.stringify(cuerpoDe(it)) });
           resp = await r.text();
         } catch (errRed) {
-          if (mostrar) setEstado('📡 Sin conexión: queda en el teléfono, se envía solo al recuperar señal', 'ok');
+          if (mostrarProgreso) setEstado('📡 Sin conexión: queda en el teléfono, se envía solo al recuperar señal', 'ok');
           break;
         }
 
@@ -155,7 +158,7 @@
           items = await colaPendiente();
           if (items.length) await esperar(ESPACIADO_MS);
         } else if (resp === 'rate-limit') {
-          if (mostrar) setEstado('Procesando... (Gemini ocupado, reintento en unos segundos)');
+          if (mostrarProgreso) setEstado('Procesando... (Gemini ocupado, reintento en unos segundos)');
           await esperar(15000);
         } else {
           it.intentos = (it.intentos || 0) + 1;
@@ -165,7 +168,7 @@
         }
       }
       const quedan = await colaPendiente();
-      if (mostrar && quedan.length === 0) setEstado('✔ Guardada en tu vault', 'ok');
+      if (mostrarProgreso && quedan.length === 0) { setEstado('✔ Guardada en tu vault', 'ok'); mostrarProgreso = false; }
     } finally {
       enviando = false;
     }
@@ -194,7 +197,7 @@
   async function empezar() {
     try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
     catch (e) { setEstado('Permití el micrófono y tocá GRABAR'); return; }
-    grabando = true; pausado = false;
+    grabando = true; pausado = false; descartando = false; mostrarProgreso = false;
     sesionId = Date.now().toString(36) + Math.floor(Math.random() * 1000);
     parte = 0; acumuladoMs = 0; t0 = Date.now();
     pintarBoton();
@@ -211,18 +214,23 @@
     const trozos = [];
     recorder.ondataavailable = (e) => { if (e.data.size) trozos.push(e.data); };
     recorder.onstop = async () => {
+      if (descartando) { // nota descartada: no guardar el último bloque ni cerrar con 'fin'
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        if (wakeLock) { wakeLock.release(); wakeLock = null; }
+        return;
+      }
       const blob = new Blob(trozos, { type: recorder.mimeType || 'audio/webm' });
       if (blob.size > 0) {
         parte++;
         await encolar({ tipo: 'audio', sesion: sesionId, parte: parte, mime: blob.type, datos: await aBase64(blob) });
       }
-      if (grabando) { nuevoTramo(); drenarCola(false); }       // sigue grabando
-      else if (pausado) { drenarCola(false); }                 // en pausa: subir lo grabado, mantener micrófono
+      if (grabando) { nuevoTramo(); drenarCola(); }            // sigue grabando
+      else if (pausado) { drenarCola(); }                      // en pausa: subir lo grabado, mantener micrófono
       else {                                                    // finalizar de verdad
         if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
         if (wakeLock) { wakeLock.release(); wakeLock = null; }
         await encolar({ tipo: 'fin', sesion: sesionId });
-        drenarCola(true);
+        drenarCola();
       }
     };
     recorder.start();
@@ -241,7 +249,7 @@
 
   function reanudar() {
     if (!pausado) return;
-    grabando = true; pausado = false;
+    grabando = true; pausado = false; mostrarProgreso = false;
     t0 = Date.now();
     pintarBoton();
     setEstado('Hablá tranquilo — tocá GUARDAR al terminar', 'grabando');
@@ -252,8 +260,7 @@
   function finalizar() {
     if (!grabando && !pausado) return;
     if (grabando) acumuladoMs += Date.now() - t0;
-    const seguiaGrabando = grabando;
-    grabando = false; pausado = false;
+    grabando = false; pausado = false; mostrarProgreso = true;
     clearTimeout(corteTimeout); clearInterval(timerInt);
     timerEl.style.visibility = 'hidden';
     pintarBoton();
@@ -264,23 +271,26 @@
       // estaba en pausa (sin grabador activo): cerrar a mano
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
-      encolar({ tipo: 'fin', sesion: sesionId }).then(() => drenarCola(true));
+      encolar({ tipo: 'fin', sesion: sesionId }).then(() => drenarCola());
     }
   }
 
   async function descartar() {
     const sesion = sesionId;
-    grabando = false; pausado = false;
+    descartando = true; grabando = false; pausado = false; mostrarProgreso = false;
     clearTimeout(corteTimeout); clearInterval(timerInt);
     timerEl.style.visibility = 'hidden';
-    if (recorder && recorder.state === 'recording') { try { recorder.stop(); } catch (e) {} }
-    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    if (recorder && recorder.state === 'recording') {
+      try { recorder.stop(); } catch (e) {} // onstop verá descartando=true: no guarda nada
+    } else {
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    }
     pintarBoton();
     setEstado('🗑 Nota descartada', 'ok');
     await borrarSesionDeCola(sesion);                  // saca los bloques no subidos de esta nota
-    await encolar({ tipo: 'descartar', sesion: sesion }); // y avisa al servidor por si algo ya subió
-    drenarCola(false);
+    await encolar({ tipo: 'descartar', sesion: sesion }); // y anula en el servidor lo que ya hubiera subido
+    drenarCola();
   }
 
   // Tap = pausar/continuar/empezar. Mantener pulsado = descartar.
@@ -308,9 +318,10 @@
     const t = txt.value.trim();
     if (!t) { setEstado('No hay nada que guardar'); return; }
     btnGuardar.disabled = true;
+    mostrarProgreso = true;
     await encolar({ tipo: 'texto', texto: t });
     txt.value = '';
-    await drenarCola(true);
+    await drenarCola();
     btnGuardar.disabled = false;
   };
 
@@ -326,11 +337,11 @@
   } else {
     (async () => {
       const items = await colaPendiente();
-      if (items.length) { setEstado('Enviando lo que quedó pendiente...'); drenarCola(true); }
+      if (items.length) { mostrarProgreso = true; setEstado('Enviando lo que quedó pendiente...'); drenarCola(); }
     })();
   }
 
-  window.addEventListener('online', () => { if (!grabando && !pausado) drenarCola(true); });
+  window.addEventListener('online', () => { if (!grabando && !pausado) { mostrarProgreso = true; drenarCola(); } });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 </script>
