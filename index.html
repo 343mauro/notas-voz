@@ -47,7 +47,7 @@
 
 <script>
   // ===== CONFIGURACIÓN =====
-  const VERSION = 'v2.3';
+  const VERSION = 'v2.4';
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
   const TROZO_MS = 2 * 60 * 1000; // la grabación se parte en bloques de 2 minutos (rinde mejor el límite gratuito)
   const ESPACIADO_MS = 6000;      // pausa entre subidas para respetar el límite gratuito de Gemini
@@ -84,8 +84,12 @@
   // ===== COLA PERSISTENTE (IndexedDB): sobrevive cierres y falta de señal =====
   function abrirDB() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('notas-voz', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('cola', { keyPath: 'id', autoIncrement: true });
+      const r = indexedDB.open('notas-voz', 2);
+      r.onupgradeneeded = () => {
+        const db = r.result;
+        if (!db.objectStoreNames.contains('cola')) db.createObjectStore('cola', { keyPath: 'id', autoIncrement: true });
+        if (!db.objectStoreNames.contains('config')) db.createObjectStore('config', { keyPath: 'k' });
+      };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
     });
@@ -93,7 +97,22 @@
   function txCola(modo) { return abrirDB().then(d => d.transaction('cola', modo).objectStore('cola')); }
   async function encolar(item) {
     const st = await txCola('readwrite');
-    return new Promise((res, rej) => { const q = st.add(item); q.onsuccess = res; q.onerror = () => rej(q.error); });
+    await new Promise((res, rej) => { const q = st.add(item); q.onsuccess = res; q.onerror = () => rej(q.error); });
+    pedirSync(); // que el service worker suba aunque después se cierre la app
+  }
+  async function guardarConfig(k, v) {
+    const d = await abrirDB();
+    return new Promise((res, rej) => {
+      const tx = d.transaction('config', 'readwrite');
+      tx.objectStore('config').put({ k: k, v: v });
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function pedirSync() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      if (reg.sync) await reg.sync.register('subir-cola');
+    } catch (e) {}
   }
   async function colaPendiente() {
     const st = await txCola('readonly');
@@ -353,6 +372,7 @@
     btnGrabar.disabled = true;
   } else {
     (async () => {
+      await guardarConfig('token', TOKEN); // el service worker lo necesita para subir en segundo plano
       const items = await colaPendiente();
       if (items.length) { mostrarProgreso = true; setEstado('Enviando lo que quedó pendiente...'); drenarCola(); }
     })();
