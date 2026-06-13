@@ -47,9 +47,9 @@
 
 <script>
   // ===== CONFIGURACIÓN =====
-  const VERSION = 'v2.2';
+  const VERSION = 'v2.3';
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
-  const TROZO_MS = 60 * 1000;     // la grabación se parte en bloques de 1 minuto
+  const TROZO_MS = 2 * 60 * 1000; // la grabación se parte en bloques de 2 minutos (rinde mejor el límite gratuito)
   const ESPACIADO_MS = 6000;      // pausa entre subidas para respetar el límite gratuito de Gemini
   const MAX_INTENTOS = 5;         // reintentos de un bloque con error antes de mandarlo al final
   const DESCARTE_MS = 3000;       // mantener pulsado este tiempo descarta la nota
@@ -71,6 +71,7 @@
 
   let grabando = false, pausado = false, descartando = false, mediaStream = null, recorder = null, corteTimeout = null;
   let sesionId = '', parte = 0, t0 = 0, acumuladoMs = 0, timerInt = null, wakeLock = null, enviando = false, mostrarProgreso = false;
+  let tramoInicio = 0, tramoAcum = 0; // tiempo de audio del bloque actual (sin contar pausas)
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
   function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -224,8 +225,8 @@
         parte++;
         await encolar({ tipo: 'audio', sesion: sesionId, parte: parte, mime: blob.type, datos: await aBase64(blob) });
       }
-      if (grabando) { nuevoTramo(); drenarCola(); }            // sigue grabando
-      else if (pausado) { drenarCola(); }                      // en pausa: subir lo grabado, mantener micrófono
+      if (grabando) { nuevoTramo(); drenarCola(); }            // bloque completo (2 min): siguiente
+      else if (pausado) { drenarCola(); }                      // fallback sin pausa nativa: esperar reanudar
       else {                                                    // finalizar de verdad
         if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
         if (wakeLock) { wakeLock.release(); wakeLock = null; }
@@ -233,9 +234,12 @@
         drenarCola();
       }
     };
+    tramoAcum = 0; tramoInicio = Date.now();
     recorder.start();
-    corteTimeout = setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, TROZO_MS);
+    corteTimeout = setTimeout(cortarTramo, TROZO_MS);
   }
+
+  function cortarTramo() { if (recorder && recorder.state === 'recording') recorder.stop(); }
 
   function pausar() {
     if (!grabando) return;
@@ -244,7 +248,14 @@
     clearTimeout(corteTimeout); clearInterval(timerInt);
     pintarBoton();
     setEstado('⏸ En pausa — tocá CONTINUAR', 'pausa');
-    if (recorder && recorder.state === 'recording') recorder.stop(); // corta el bloque actual
+    if (recorder && recorder.state === 'recording') {
+      if (typeof recorder.pause === 'function') {
+        tramoAcum += Date.now() - tramoInicio; // congela el bloque: al continuar suma al mismo
+        recorder.pause();
+      } else {
+        recorder.stop(); // navegador sin pausa nativa: corta el bloque (lo retoma al reanudar)
+      }
+    }
   }
 
   function reanudar() {
@@ -254,7 +265,13 @@
     pintarBoton();
     setEstado('Hablá tranquilo — tocá GUARDAR al terminar', 'grabando');
     timerInt = setInterval(mostrarTimer, 1000);
-    nuevoTramo();
+    if (recorder && recorder.state === 'paused') {
+      tramoInicio = Date.now();
+      recorder.resume(); // continúa el MISMO bloque
+      corteTimeout = setTimeout(cortarTramo, Math.max(1000, TROZO_MS - tramoAcum));
+    } else {
+      nuevoTramo(); // fallback: bloque nuevo
+    }
   }
 
   function finalizar() {
@@ -265,7 +282,7 @@
     timerEl.style.visibility = 'hidden';
     pintarBoton();
     setEstado('Transcribiendo y guardando...');
-    if (recorder && recorder.state === 'recording') {
+    if (recorder && (recorder.state === 'recording' || recorder.state === 'paused')) {
       recorder.stop(); // onstop hará el 'fin' porque grabando/pausado ya son false
     } else {
       // estaba en pausa (sin grabador activo): cerrar a mano
@@ -280,7 +297,7 @@
     descartando = true; grabando = false; pausado = false; mostrarProgreso = false;
     clearTimeout(corteTimeout); clearInterval(timerInt);
     timerEl.style.visibility = 'hidden';
-    if (recorder && recorder.state === 'recording') {
+    if (recorder && (recorder.state === 'recording' || recorder.state === 'paused')) {
       try { recorder.stop(); } catch (e) {} // onstop verá descartando=true: no guarda nada
     } else {
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
