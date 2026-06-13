@@ -1,6 +1,6 @@
 // Guarda la app en el teléfono para que abra sin internet.
 // Estrategia: sirve la copia guardada al instante y la actualiza en segundo plano.
-const CACHE = 'notas-voz-v3';
+const CACHE = 'notas-voz-v4';
 const PRECARGA = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {

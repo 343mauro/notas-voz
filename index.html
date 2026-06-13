@@ -15,21 +15,25 @@
          display:flex; flex-direction:column; align-items:center;
          padding:12px calc(12px + env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
          min-height:100vh; box-sizing:border-box; }
-  #estado { font-size:22px; font-weight:bold; margin:6px 0; min-height:30px; text-align:center; }
+  #estado { font-size:21px; font-weight:bold; margin:6px 0; min-height:28px; text-align:center; }
   #estado.grabando { color:#f87171; }
+  #estado.pausa { color:#fbbf24; }
   #estado.ok { color:#4ade80; }
-  #timer { font-size:52px; font-weight:bold; color:#f87171; min-height:60px;
+  #timer { font-size:50px; font-weight:bold; color:#f87171; min-height:58px;
            visibility:hidden; font-variant-numeric:tabular-nums; }
   #texto { width:100%; flex:1; min-height:13vh; font-size:19px; border-radius:14px; border:none;
            padding:12px; box-sizing:border-box; background:#2a2a3c; color:#eee; }
   button { width:100%; border:none; border-radius:18px; color:#fff; font-weight:bold;
-           margin-top:12px; padding:24px 0; font-size:25px; }
+           margin-top:12px; padding:24px 0; font-size:25px;
+           -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; touch-action:manipulation; }
   button:disabled { opacity:.45; }
   #btnGrabar { background:#7c3aed; }
   #btnGrabar.rec { background:#dc2626; animation:p 1.2s infinite; }
+  #btnGrabar.pausa { background:#d97706; animation:none; }
   @keyframes p { 50% { opacity:.7; } }
   #btnGuardar { background:#16a34a; padding:30px 0; font-size:28px; }
-  #version { margin-top:8px; font-size:12px; color:#6b6b85; }
+  #ayuda { margin-top:8px; font-size:12px; color:#8a8aa5; text-align:center; min-height:16px; }
+  #version { margin-top:4px; font-size:12px; color:#6b6b85; }
 </style>
 </head>
 <body>
@@ -38,15 +42,17 @@
   <textarea id="texto" placeholder="...o escribí/dictá acá con el teclado y tocá GUARDAR."></textarea>
   <button id="btnGuardar">💾 GUARDAR NOTA</button>
   <button id="btnGrabar">🎤 GRABAR</button>
+  <div id="ayuda"></div>
   <div id="version"></div>
 
 <script>
   // ===== CONFIGURACIÓN =====
-  const VERSION = 'v2.0';
+  const VERSION = 'v2.1';
   const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
   const TROZO_MS = 60 * 1000;     // la grabación se parte en bloques de 1 minuto
   const ESPACIADO_MS = 6000;      // pausa entre subidas para respetar el límite gratuito de Gemini
   const MAX_INTENTOS = 5;         // reintentos de un bloque con error antes de mandarlo al final
+  const DESCARTE_MS = 3000;       // mantener pulsado este tiempo descarta la nota
 
   // La clave NO va en el código público: llega una vez en el enlace (#clave) y queda guardada en el teléfono.
   if (location.hash.length > 1) {
@@ -60,15 +66,17 @@
   const timerEl = document.getElementById('timer');
   const btnGrabar = document.getElementById('btnGrabar');
   const btnGuardar = document.getElementById('btnGuardar');
+  const ayuda = document.getElementById('ayuda');
   document.getElementById('version').textContent = VERSION;
 
-  let grabando = false, mediaStream = null, recorder = null, corteTimeout = null;
-  let sesionId = '', parte = 0, t0 = 0, timerInt = null, wakeLock = null, enviando = false;
+  let grabando = false, pausado = false, mediaStream = null, recorder = null, corteTimeout = null;
+  let sesionId = '', parte = 0, t0 = 0, acumuladoMs = 0, timerInt = null, wakeLock = null, enviando = false;
 
   function setEstado(msg, clase) { est.textContent = msg; est.className = clase || ''; }
   function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
   function mostrarTimer() {
-    const s = Math.floor((Date.now() - t0) / 1000);
+    const ms = acumuladoMs + (grabando ? Date.now() - t0 : 0);
+    const s = Math.floor(ms / 1000);
     timerEl.textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
 
@@ -98,21 +106,26 @@
     const st = await txCola('readwrite');
     return new Promise((res, rej) => { const q = st.put(item); q.onsuccess = res; q.onerror = () => rej(q.error); });
   }
-  // Reencola al final (nuevo id) y borra el viejo: el bloque no traba a los demás.
   async function moverAlFinal(item) {
     const copia = Object.assign({}, item); delete copia.id;
     await encolar(copia);
     await quitarDeCola(item.id);
   }
+  // Borra de la cola los bloques (y el fin) de una sesión descartada que no subieron.
+  async function borrarSesionDeCola(sesion) {
+    const items = await colaPendiente();
+    for (const it of items) {
+      if ((it.tipo === 'audio' || it.tipo === 'fin') && it.sesion === sesion) await quitarDeCola(it.id);
+    }
+  }
 
   function cuerpoDe(it) {
-    if (it.tipo === 'audio') return { token: TOKEN, accion: 'audio', sesion: it.sesion, parte: it.parte, mime: it.mime, audio: it.datos };
-    if (it.tipo === 'fin')   return { token: TOKEN, accion: 'fin', sesion: it.sesion };
+    if (it.tipo === 'audio')     return { token: TOKEN, accion: 'audio', sesion: it.sesion, parte: it.parte, mime: it.mime, audio: it.datos };
+    if (it.tipo === 'fin')       return { token: TOKEN, accion: 'fin', sesion: it.sesion };
+    if (it.tipo === 'descartar') return { token: TOKEN, accion: 'descartar', sesion: it.sesion };
     return { token: TOKEN, texto: it.texto };
   }
 
-  // Drena la cola en orden. Distingue falta de señal real (corta y reintenta luego)
-  // de errores del servidor (reintenta el bloque y, si insiste, lo manda al final).
   async function drenarCola(mostrar) {
     if (enviando) return;
     enviando = true;
@@ -121,10 +134,9 @@
       let items = await colaPendiente();
       while (items.length && vueltas++ < 1000) {
         let it = items[0];
-        // 'fin' se procesa recién cuando ya no quedan partes de audio/texto por delante.
         if (it.tipo === 'fin' && items.length > 1) { await moverAlFinal(it); items = await colaPendiente(); continue; }
 
-        const reales = items.filter(x => x.tipo !== 'fin').length;
+        const reales = items.filter(x => x.tipo === 'audio' || x.tipo === 'texto').length;
         if (mostrar) setEstado(reales > 0
           ? 'Guardando... (queda' + (reales > 1 ? 'n ' + reales + ' partes)' : ' 1 parte)')
           : 'Cerrando nota...');
@@ -135,7 +147,7 @@
           resp = await r.text();
         } catch (errRed) {
           if (mostrar) setEstado('📡 Sin conexión: queda en el teléfono, se envía solo al recuperar señal', 'ok');
-          break; // problema de red REAL: reintentar en el próximo 'online' o al reabrir
+          break;
         }
 
         if (resp === 'ok' || resp === 'vacío') {
@@ -145,7 +157,7 @@
         } else if (resp === 'rate-limit') {
           if (mostrar) setEstado('Procesando... (Gemini ocupado, reintento en unos segundos)');
           await esperar(15000);
-        } else { // 'error-transcripcion', 'error', 'no-autorizado', etc.
+        } else {
           it.intentos = (it.intentos || 0) + 1;
           if (it.intentos >= MAX_INTENTOS) { await moverAlFinal(it); }
           else { await actualizarEnCola(it); await esperar(8000); }
@@ -172,18 +184,22 @@
   const tipoAudio = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))
     ? 'audio/webm' : '';
 
+  function pintarBoton() {
+    btnGrabar.classList.toggle('rec', grabando);
+    btnGrabar.classList.toggle('pausa', pausado);
+    btnGrabar.textContent = grabando ? '⏺ GRABANDO' : (pausado ? '▶ CONTINUAR' : '🎤 GRABAR');
+    ayuda.textContent = (grabando || pausado) ? 'Tocá para pausar · mantené 3 s para descartar' : '';
+  }
+
   async function empezar() {
-    if (grabando) return;
     try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
     catch (e) { setEstado('Permití el micrófono y tocá GRABAR'); return; }
-    grabando = true;
+    grabando = true; pausado = false;
     sesionId = Date.now().toString(36) + Math.floor(Math.random() * 1000);
-    parte = 0;
-    btnGrabar.classList.add('rec');
-    btnGrabar.textContent = '⏺ GRABANDO';
+    parte = 0; acumuladoMs = 0; t0 = Date.now();
+    pintarBoton();
     setEstado('Hablá tranquilo — tocá GUARDAR al terminar', 'grabando');
-    t0 = Date.now(); mostrarTimer();
-    timerEl.style.visibility = 'visible';
+    mostrarTimer(); timerEl.style.visibility = 'visible';
     timerInt = setInterval(mostrarTimer, 1000);
     try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
     nuevoTramo();
@@ -200,10 +216,9 @@
         parte++;
         await encolar({ tipo: 'audio', sesion: sesionId, parte: parte, mime: blob.type, datos: await aBase64(blob) });
       }
-      if (grabando) {
-        nuevoTramo();         // siguiente bloque, sin que el usuario lo note
-        drenarCola(false);    // y el anterior se sube en segundo plano
-      } else {
+      if (grabando) { nuevoTramo(); drenarCola(false); }       // sigue grabando
+      else if (pausado) { drenarCola(false); }                 // en pausa: subir lo grabado, mantener micrófono
+      else {                                                    // finalizar de verdad
         if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
         if (wakeLock) { wakeLock.release(); wakeLock = null; }
         await encolar({ tipo: 'fin', sesion: sesionId });
@@ -214,24 +229,82 @@
     corteTimeout = setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, TROZO_MS);
   }
 
-  function parar() {
-    grabando = false;
-    btnGrabar.classList.remove('rec');
-    btnGrabar.textContent = '🎤 GRABAR';
-    clearTimeout(corteTimeout);
-    clearInterval(timerInt);
-    timerEl.style.visibility = 'hidden';
-    setEstado('Transcribiendo y guardando...');
-    if (recorder && recorder.state === 'recording') recorder.stop();
+  function pausar() {
+    if (!grabando) return;
+    acumuladoMs += Date.now() - t0;
+    grabando = false; pausado = true;
+    clearTimeout(corteTimeout); clearInterval(timerInt);
+    pintarBoton();
+    setEstado('⏸ En pausa — tocá CONTINUAR', 'pausa');
+    if (recorder && recorder.state === 'recording') recorder.stop(); // corta el bloque actual
   }
 
+  function reanudar() {
+    if (!pausado) return;
+    grabando = true; pausado = false;
+    t0 = Date.now();
+    pintarBoton();
+    setEstado('Hablá tranquilo — tocá GUARDAR al terminar', 'grabando');
+    timerInt = setInterval(mostrarTimer, 1000);
+    nuevoTramo();
+  }
+
+  function finalizar() {
+    if (!grabando && !pausado) return;
+    if (grabando) acumuladoMs += Date.now() - t0;
+    const seguiaGrabando = grabando;
+    grabando = false; pausado = false;
+    clearTimeout(corteTimeout); clearInterval(timerInt);
+    timerEl.style.visibility = 'hidden';
+    pintarBoton();
+    setEstado('Transcribiendo y guardando...');
+    if (recorder && recorder.state === 'recording') {
+      recorder.stop(); // onstop hará el 'fin' porque grabando/pausado ya son false
+    } else {
+      // estaba en pausa (sin grabador activo): cerrar a mano
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (wakeLock) { wakeLock.release(); wakeLock = null; }
+      encolar({ tipo: 'fin', sesion: sesionId }).then(() => drenarCola(true));
+    }
+  }
+
+  async function descartar() {
+    const sesion = sesionId;
+    grabando = false; pausado = false;
+    clearTimeout(corteTimeout); clearInterval(timerInt);
+    timerEl.style.visibility = 'hidden';
+    if (recorder && recorder.state === 'recording') { try { recorder.stop(); } catch (e) {} }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    pintarBoton();
+    setEstado('🗑 Nota descartada', 'ok');
+    await borrarSesionDeCola(sesion);                  // saca los bloques no subidos de esta nota
+    await encolar({ tipo: 'descartar', sesion: sesion }); // y avisa al servidor por si algo ya subió
+    drenarCola(false);
+  }
+
+  // Tap = pausar/continuar/empezar. Mantener pulsado = descartar.
+  let pressTimer = null, longPressFired = false;
+  btnGrabar.addEventListener('pointerdown', () => {
+    if (grabando || pausado) {
+      longPressFired = false;
+      ayuda.textContent = 'Seguí apretando para descartar...';
+      pressTimer = setTimeout(() => { longPressFired = true; descartar(); }, DESCARTE_MS);
+    }
+  });
+  function cancelarPress() { clearTimeout(pressTimer); pintarBoton(); }
+  btnGrabar.addEventListener('pointerup', cancelarPress);
+  btnGrabar.addEventListener('pointercancel', cancelarPress);
+  btnGrabar.addEventListener('pointerleave', cancelarPress);
   btnGrabar.onclick = () => {
-    if (grabando) { setEstado('Para terminar tocá GUARDAR NOTA', 'grabando'); return; }
-    empezar();
+    if (longPressFired) { longPressFired = false; return; } // fue descarte, no tap
+    if (grabando) pausar();
+    else if (pausado) reanudar();
+    else empezar();
   };
 
   btnGuardar.onclick = async () => {
-    if (grabando) { parar(); return; }
+    if (grabando || pausado) { finalizar(); return; }
     const t = txt.value.trim();
     if (!t) { setEstado('No hay nada que guardar'); return; }
     btnGuardar.disabled = true;
@@ -241,9 +314,8 @@
     btnGuardar.disabled = false;
   };
 
-  // Avisar si se intenta cerrar la app con una grabación en curso.
   window.addEventListener('beforeunload', (e) => {
-    if (grabando) { e.preventDefault(); e.returnValue = ''; }
+    if (grabando || pausado) { e.preventDefault(); e.returnValue = ''; }
   });
 
   // ===== AL ABRIR =====
@@ -258,10 +330,8 @@
     })();
   }
 
-  // Si vuelve la señal con la app abierta, mandar lo que quedó en cola.
-  window.addEventListener('online', () => { if (!grabando) drenarCola(true); });
+  window.addEventListener('online', () => { if (!grabando && !pausado) drenarCola(true); });
 
-  // Dejar la app guardada en el teléfono para abrirla sin internet.
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 </script>
 </body>
