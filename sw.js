@@ -1,8 +1,8 @@
 // Service worker: cachea la app para uso offline Y sube la cola en segundo plano
 // (Background Sync) apenas vuelve internet, aunque la app esté cerrada.
-const CACHE = 'notas-voz-v7';
+const CACHE = 'notas-voz-v8';
 const PRECARGA = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
-const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbzv6R8TVWWnaEyePZr5HOCwXFcycW993QNsz5k5vBujdvaGCy-5vpr7tZvY56WOvtzz/exec';
+const URL_SCRIPT = 'https://script.google.com/macros/s/AKfycbw-y3ygx8GP0Dcsy3CTg9fcNiVK68bIaonrb7GZSdFLz2jD6uqN9sI56jF48I9KvKnyxA/exec';
 const ESPACIADO_MS = 6000;
 const MAX_INTENTOS = 5;
 
